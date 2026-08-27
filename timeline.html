@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Flagged Timeline — Active Deception Proxy{% endblock %}
+{% block refresh %}<meta http-equiv="refresh" content="{{ auto_refresh_seconds }}">{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <h2>Flagged requests — most recent first (auto-refreshes every {{ auto_refresh_seconds }}s)</h2>
+  {% if entries %}
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp</th>
+        <th>IP</th>
+        <th>Method</th>
+        <th>Path</th>
+        <th>Reasons</th>
+        <th>Severity</th>
+        <th>Routed to</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in entries %}
+      {% set extra = e.get('extra', {}) %}
+      <tr>
+        <td>{{ e.get('timestamp', '') }}</td>
+        <td><a class="ip-link" href="/ip/{{ e.get('ip', '') }}">{{ e.get('ip', '') }}</a></td>
+        <td>{{ e.get('method', '') }}</td>
+        <td><code>{{ e.get('path', '') }}</code></td>
+        <td>{{ extra.get('reasons', []) | join(', ') }}</td>
+        <td><span class="badge severity-{{ extra.get('severity', 'low') }}">{{ extra.get('severity', 'low') }}</span></td>
+        <td>
+          {% if extra.get('routed_to') == 'honeypot' %}
+          <span class="badge badge-honeypot">honeypot</span>
+          {% else %}
+          <span class="badge badge-backend">backend</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No flagged requests yet.</p>
+  {% endif %}
+</div>
+{% endblock %}
