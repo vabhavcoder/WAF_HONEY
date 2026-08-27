@@ -1,3 +1,0 @@
-{"timestamp":"2026-08-01T07:23:39.166507+00:00","ip":"127.0.0.1","method":"GET","path":"/?","status":200}
-{"timestamp":"2026-08-01T07:23:41.265707+00:00","ip":"127.0.0.1","method":"GET","path":"/search?q=proxy-test","status":200}
-{"timestamp":"2026-08-01T07:24:32.906723+00:00","ip":"127.0.0.1","method":"GET","path":"/backend-down-check?","status":502,"extra":{"error":"backend_connection_error","detail":"HTTPConnectionPool(host='localhost', port=5000): Max retries exceeded with url: /backend-down-check (Caused by NewConnectionError(\"HTTPConnection(host='localhost', port=5000): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it\"))"}}
