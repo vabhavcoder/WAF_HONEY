@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Honeypot Log — Active Deception Proxy{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <h2>Honeypot interactions — most recent first</h2>
+  {% if rows %}
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp</th>
+        <th>IP</th>
+        <th>Service</th>
+        <th>Event</th>
+        <th>Captured</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.timestamp }}</td>
+        <td><a class="ip-link" href="/ip/{{ row.ip }}">{{ row.ip }}</a></td>
+        <td><span class="badge {{ 'badge-honeypot' if row.service == 'ssh' else 'badge-backend' }}">{{ row.service }}</span></td>
+        <td>{{ row.event_type }}</td>
+        <td>{{ row.summary }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No honeypot activity logged yet.</p>
+  {% endif %}
+</div>
+{% endblock %}
