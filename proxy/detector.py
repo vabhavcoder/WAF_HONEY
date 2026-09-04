@@ -190,12 +190,24 @@ def inspect_request(ip, method, path, query_string, body, headers):
             if name not in reasons:
                 _record(name, severity)
 
-    # --- rate limiting (independent of content-based checks above) ---
+       # --- rate limiting (independent of content-based checks above) ---
     if check_rate_limit(ip):
         _record("rate_limit", RATE_LIMIT_SEVERITY)
 
+    # Only medium/high-confidence matches actually flag the request.
+    # "low" severity patterns (bare semicolon, --/#//* comment sequences)
+    # are kept in `reasons` for visibility/logging, but never flag alone —
+    # they match too much ordinary traffic to act on by themselves. A
+    # multi-cookie browser request's raw Cookie header always contains
+    # "; " between cookies, and any Referer with a URL fragment (#section)
+    # always contains "#" — both would otherwise flag on every normal
+    # request. This is the actual gate on the routing decision now,
+    # not just a display label: server.py's honeypot redirect reads
+    # this `flagged` value directly.
+    flagged = _SEVERITY_RANK[max_severity] >= _SEVERITY_RANK["medium"]
+
     return {
-        "flagged": bool(reasons),
+        "flagged": flagged,
         "reasons": reasons,
         "severity": max_severity if reasons else "low",
     }
