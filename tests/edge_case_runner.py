@@ -158,37 +158,61 @@ def entry_reasons(entry):
 # =======================================================================
 # 1. ENCODING BYPASS ATTEMPTS -- should still be flagged
 # =======================================================================
+def _check_encoding_case(name, marker_path, since, resp, err):
+    if err:
+        record(name, "encoding_bypass", False, f"request failed: {err}")
+        return
+    entry = find_recent_log_entry(
+        REQUESTS_LOG, since, lambda e: str(e.get(FIELD_PATH, "")).startswith(marker_path)
+    )
+    flagged = entry_flagged(entry)
+    if flagged is True:
+        record(name, "encoding_bypass", True,
+               f"status={resp.status_code}, reasons={entry_reasons(entry)}")
+    elif flagged is False:
+        record(name, "encoding_bypass", False,
+               f"NOT flagged -- possible detection bypass (status={resp.status_code})")
+    else:
+        record(name, "encoding_bypass", None,
+               "could not confirm from logs (READ_LOGS off, or no matching entry found -- "
+               "check FIELD_* config and the path used)", warn=True)
+
+
 def test_encoding_bypasses():
-    cases = [
-        ("URL-encoded SQLi", "GET", "/search", {"id": "1%27%20OR%20%271%27=%271"}, None),
-        ("Double-encoded XSS", "GET", "/search", {"q": "%253Cscript%253E"}, None),
+    # Cases that are ALREADY percent-encoded must be sent as a literal
+    # string appended directly to the path/query -- passing a
+    # pre-encoded string through requests' `params=` dict makes requests
+    # percent-encode it AGAIN (e.g. "%27" becomes "%2527"), silently
+    # turning a single-encoded payload into a double/triple-encoded one
+    # that no longer matches anything, even after this app's own
+    # single-unquote decode pass. Confirmed this was a test-harness
+    # artifact, not a real detection bypass, by tracing what bytes
+    # actually land on the wire in each case.
+    raw_query_cases = [
+        ("URL-encoded SQLi", "/search?id=1%27%20OR%20%271%27=%271"),
+        ("Double-encoded XSS", "/search?q=%253Cscript%253E"),
+    ]
+    # These use real characters (not pre-encoded), so letting requests
+    # encode them normally (via params=/data=) matches how an actual
+    # client would send them -- no change needed here.
+    literal_cases = [
         ("Mixed-case UNION SELECT", "GET", "/search", {"id": "1 UnIoN SeLeCt password"}, None),
         ("Mixed-case script tag", "POST", "/comment", None, {"text": "<ScRiPt>alert(1)</ScRiPt>"}),
     ]
-    for name, method, path, params, data in cases:
+
+    for name, full_path in raw_query_cases:
+        since = datetime.now(timezone.utc)
+        resp, err = safe_request("GET", full_path)
+        marker_path = full_path.split("?")[0]
+        _check_encoding_case(name, marker_path, since, resp, err)
+
+    for name, method, path, params, data in literal_cases:
         since = datetime.now(timezone.utc)
         if params is not None:
             resp, err = safe_request(method, path, params=params)
         else:
             resp, err = safe_request(method, path, data=data)
-        if err:
-            record(name, "encoding_bypass", False, f"request failed: {err}")
-            continue
-
-        entry = find_recent_log_entry(
-            REQUESTS_LOG, since, lambda e: str(e.get(FIELD_PATH, "")).startswith(path)
-        )
-        flagged = entry_flagged(entry)
-        if flagged is True:
-            record(name, "encoding_bypass", True,
-                   f"status={resp.status_code}, reasons={entry_reasons(entry)}")
-        elif flagged is False:
-            record(name, "encoding_bypass", False,
-                   f"NOT flagged -- possible detection bypass (status={resp.status_code})")
-        else:
-            record(name, "encoding_bypass", None,
-                   "could not confirm from logs (READ_LOGS off, or no matching entry found -- "
-                   "check FIELD_* config and the path used)", warn=True)
+        _check_encoding_case(name, path, since, resp, err)
 
 
 # =======================================================================
