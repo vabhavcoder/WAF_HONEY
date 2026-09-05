@@ -23,9 +23,17 @@ function if your app uses different paths.
 import json
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
+
+# Verified against the actual project code (proxy/logger.py,
+# proxy/detector.py, proxy/config.py) on 2026-09-05. FIELD_* constants
+# below match exactly -- proxy/logger.py writes timestamps as
+# timezone-aware UTC ISO-8601 (datetime.now(timezone.utc).isoformat()),
+# which is why every "since" marker in this script must ALSO be
+# timezone-aware (datetime.now(timezone.utc), never datetime.utcnow())
+# -- comparing an aware and a naive datetime raises TypeError.
 
 # ---------------------------------------------------------------------
 # CONFIG -- adjust these to match your actual setup / log schema
@@ -158,7 +166,7 @@ def test_encoding_bypasses():
         ("Mixed-case script tag", "POST", "/comment", None, {"text": "<ScRiPt>alert(1)</ScRiPt>"}),
     ]
     for name, method, path, params, data in cases:
-        since = datetime.utcnow()
+        since = datetime.now(timezone.utc)
         if params is not None:
             resp, err = safe_request(method, path, params=params)
         else:
@@ -225,7 +233,7 @@ def test_false_positive_boundaries():
          dict(data={"name": "O'Brien"})),
     ]
     for name, method, path, kwargs in cases:
-        since = datetime.utcnow()
+        since = datetime.now(timezone.utc)
         resp, err = safe_request(method, path, **kwargs)
         if err:
             record(name, "false_positive", False, f"request failed: {err}")
@@ -250,7 +258,7 @@ def test_false_positive_boundaries():
 # 4. HONEYPOT-ROUTING CONSISTENCY
 # =======================================================================
 def test_honeypot_consistency():
-    since = datetime.utcnow()
+    since = datetime.now(timezone.utc)
     payload_path = "/search"
     payload_params = {"id": "1' OR '1'='1"}
 
@@ -273,7 +281,7 @@ def test_honeypot_consistency():
             entries = _read_log(HONEYPOT_LOG)
             honeypot_entries = [
                 e for e in entries
-                if (_parse_ts(e.get(FIELD_TIMESTAMP)) or datetime.min) >= since
+                if (_parse_ts(e.get(FIELD_TIMESTAMP)) or datetime.min.replace(tzinfo=timezone.utc)) >= since
             ]
             if len(honeypot_entries) >= 5:
                 break
@@ -300,71 +308,100 @@ def test_honeypot_consistency():
 # 5. RATE-LIMIT EDGE BEHAVIOR
 # =======================================================================
 def test_rate_limit_threshold():
+    """
+    IMPORTANT: this app never returns HTTP 429. A rate-limited request
+    is simply routed to the honeypot, exactly like a content-flagged
+    request (see proxy/server.py: `if detection["flagged"]:` routes to
+    HONEYPOT_WEB_URL either way) -- there is no distinct "blocked"
+    status code to check for. So the only way to detect exactly when
+    rate limiting kicked in is to read requests.log and look for the
+    "rate_limit" reason, not to inspect HTTP status codes.
+    """
     path = "/"
-    statuses = []
-    for _ in range(RATE_LIMIT_COUNT + 2):
-        resp, err = safe_request("GET", path)
-        statuses.append(None if err else resp.status_code)
+    since = datetime.now(timezone.utc)
+    count = RATE_LIMIT_COUNT + 3
 
-    blocked_indices = [i for i, s in enumerate(statuses) if s == 429]
-    if not blocked_indices:
-        record("Rate limit triggers at all", "rate_limit", False,
-               f"sent {RATE_LIMIT_COUNT + 2} requests, none returned 429 -- "
-               f"statuses seen: {statuses}. Either the limit wasn't reached, or "
-               f"rate limiting isn't wired into this route/response path.")
+    errors = []
+    for _ in range(count):
+        resp, err = safe_request("GET", path)
+        if err:
+            errors.append(err)
+
+    if errors:
+        record("Rate limit burst -- no crashes", "rate_limit", False,
+               f"{len(errors)}/{count} requests errored, e.g.: {errors[0]}")
+    else:
+        record("Rate limit burst -- no crashes", "rate_limit", True, f"all {count} completed")
+
+    if not READ_LOGS:
+        record("Rate limit boundary (off-by-one check)", "rate_limit", None,
+               "READ_LOGS is off -- cannot verify without reading requests.log", warn=True)
         return
 
-    first_block = blocked_indices[0]
-    expected_at_ge = RATE_LIMIT_COUNT       # 0-indexed: request #(COUNT+1) blocked -> uses '>'
-    expected_at_gt = RATE_LIMIT_COUNT - 1   # 0-indexed: request #COUNT blocked -> uses '>='
-    detail = f"first 429 at request #{first_block + 1} (configured limit={RATE_LIMIT_COUNT}); statuses={statuses}"
+    entries = []
+    for _ in range(LOG_POLL_TRIES):
+        all_entries = _read_log(REQUESTS_LOG)
+        entries = [
+            e for e in all_entries
+            if e.get(FIELD_PATH) == path
+            and (_parse_ts(e.get(FIELD_TIMESTAMP)) or datetime.min.replace(tzinfo=timezone.utc)) >= since
+        ]
+        if len(entries) >= count:
+            break
+        time.sleep(LOG_POLL_DELAY)
 
-    if first_block == expected_at_ge:
+    entries.sort(key=lambda e: e.get(FIELD_TIMESTAMP, ""))
+
+    if len(entries) < count:
+        record("Rate limit boundary (off-by-one check)", "rate_limit", False,
+               f"expected {count} matching log entries for '{path}', found only {len(entries)} -- "
+               f"logs may still be flushing, or another process is also hitting '{path}'")
+        return
+
+    flagged_positions = [i for i, e in enumerate(entries) if "rate_limit" in entry_reasons(e)]
+    if not flagged_positions:
+        record("Rate limit triggers at all", "rate_limit", False,
+               f"sent {count} requests to '{path}', none were flagged with reason "
+               f"'rate_limit' in requests.log (checked {len(entries)} matching entries)")
+        return
+
+    first_block = flagged_positions[0]  # 0-indexed position within this burst
+    expected_gt = RATE_LIMIT_COUNT       # request #(COUNT+1), 0-indexed -- matches check_rate_limit()'s "> COUNT"
+    detail = (f"first 'rate_limit' flag at request #{first_block + 1} of this burst "
+              f"(configured RATE_LIMIT_COUNT={RATE_LIMIT_COUNT})")
+
+    if first_block == expected_gt:
         record("Rate limit boundary (off-by-one check)", "rate_limit", True,
-               detail + " -- limiter allows exactly N requests then blocks (uses '>' semantics)")
-    elif first_block == expected_at_gt:
-        record("Rate limit boundary (off-by-one check)", "rate_limit", True,
-               detail + " -- limiter blocks on the Nth request itself (uses '>=' semantics)")
+               detail + " -- matches proxy/detector.py's check_rate_limit(), which allows "
+                        "exactly COUNT requests then flags the (COUNT+1)th ('>' semantics)")
     else:
         record("Rate limit boundary (off-by-one check)", "rate_limit", False,
-               detail + " -- blocked at an unexpected position, check the sliding-window logic")
+               detail + f" -- expected it at request #{expected_gt + 1}; check for drift in "
+                        f"the sliding-window logic, or note if earlier tests in this run left "
+                        f"stale entries in this IP's window (see the pre-test sleep in main())")
 
 
 def test_rate_limit_per_ip_isolation():
     """
-    IMPORTANT LIMITATION: a single machine only has one real source IP.
-    This test spoofs X-Forwarded-For to approximate two different
-    clients. It only proves anything if your proxy's rate limiter
-    actually reads and trusts that header as the client identity.
+    Not executed automatically. A single test host has exactly one real
+    source IP, and the rate limiter correctly keys off
+    request.remote_addr (the actual TCP source) rather than a
+    client-controlled header -- spoofing X-Forwarded-For proves nothing
+    here, since check_rate_limit() never reads that header at all, so
+    both "spoofed" identities are really the same IP as far as the
+    limiter is concerned, and any result from that would be arbitrary,
+    not a real answer.
 
-    If your limiter correctly keys off request.remote_addr (the real
-    TCP source, which is the recommended/secure approach and NOT
-    something a client can spoof), then BOTH "ip_a" and "ip_b" here are
-    really the same source as far as the limiter is concerned, and this
-    test cannot distinguish "isolated correctly" from "shared correctly
-    because they're actually the same IP". Treat a WARN result here as
-    inconclusive, not as a pass -- for a real answer, run this same
-    scenario from two separate VMs (e.g. Kali + your own machine) hitting
-    the target at the same time.
+    To actually verify per-IP isolation: from Kali, exhaust the rate
+    limit against the target (RATE_LIMIT_COUNT+1 quick requests to '/'),
+    then immediately send one request from a second host (or the target
+    machine itself, hitting its own proxy) and confirm THAT source is
+    not also flagged with 'rate_limit' in requests.log. This needs two
+    real hosts and is a manual step, not something this script can do.
     """
-    ip_a = "10.10.10.101"
-    ip_b = "10.10.10.102"
-
-    for _ in range(RATE_LIMIT_COUNT + 1):
-        safe_request("GET", "/", headers={"X-Forwarded-For": ip_a})
-
-    resp_a, err_a = safe_request("GET", "/", headers={"X-Forwarded-For": ip_a})
-    resp_b, err_b = safe_request("GET", "/", headers={"X-Forwarded-For": ip_b})
-
-    status_a = None if err_a else resp_a.status_code
-    status_b = None if err_b else resp_b.status_code
-
-    record("Per-IP rate-limit isolation (X-Forwarded-For approximation)", "rate_limit",
-           None,
-           f"status_a={status_a}, status_b={status_b}. This test is INCONCLUSIVE by "
-           f"itself -- see the docstring in test_rate_limit_per_ip_isolation() for why. "
-           f"Re-run manually from two separate hosts for a real answer.",
-           warn=True)
+    record("Per-IP rate-limit isolation", "rate_limit", None,
+           "not automated -- requires two real source hosts, see docstring "
+           "in test_rate_limit_per_ip_isolation() for the manual steps", warn=True)
 
 
 # =======================================================================
@@ -385,6 +422,15 @@ def main():
     test_honeypot_consistency()
 
     print("\n== 5. Rate-limit edge behavior ==")
+    # Sections 1-4 already sent ~18 requests from this same source IP.
+    # RATE_LIMIT_WINDOW is a sliding window (default 10s), so without
+    # this pause those earlier requests could still be counted here,
+    # making the off-by-one check trigger earlier than expected --
+    # not because of a detector bug, but because of shared per-IP state
+    # across tests. Sleeping past the window first gives a clean slate.
+    print(f"(waiting {RATE_LIMIT_WINDOW + 1}s so earlier tests' requests age out of "
+          f"this IP's rate-limit window before starting a clean measurement...)")
+    time.sleep(RATE_LIMIT_WINDOW + 1)
     test_rate_limit_threshold()
     print(f"(waiting {RATE_LIMIT_WINDOW + 1}s for the rate-limit window to reset...)")
     time.sleep(RATE_LIMIT_WINDOW + 1)
